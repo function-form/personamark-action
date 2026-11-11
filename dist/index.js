@@ -78,6 +78,51 @@ var PersonaMark = class {
   }
 };
 
+// src/comment.ts
+var MARKER = "<!-- personamark-audit -->";
+var GitHubError = class extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+  status;
+};
+async function postComment(target, markdown, fetchImpl = fetch) {
+  const base = `${target.apiUrl.replace(/\/+$/, "")}/repos/${target.repository}`;
+  const call = async (method, path, body2) => {
+    const response = await fetchImpl(`${base}${path}`, {
+      method,
+      headers: {
+        authorization: `Bearer ${target.token}`,
+        accept: "application/vnd.github+json",
+        "x-github-api-version": "2022-11-28",
+        ...body2 ? { "content-type": "application/json" } : {}
+      },
+      ...body2 ? { body: JSON.stringify(body2) } : {}
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new GitHubError(response.status, detail.message ?? `HTTP ${response.status}`);
+    }
+    return await response.json();
+  };
+  const body = `${MARKER}
+${markdown}`;
+  const pulls = await call("GET", `/commits/${target.sha}/pulls`);
+  const pull = pulls[0];
+  if (pull) {
+    const comments = await call(
+      "GET",
+      `/issues/${pull.number}/comments?per_page=100`
+    );
+    const ours = comments.findLast((comment2) => comment2.body?.startsWith(MARKER));
+    const saved2 = ours ? await call("PATCH", `/issues/comments/${ours.id}`, { body }) : await call("POST", `/issues/${pull.number}/comments`, { body });
+    return { on: "pull", number: pull.number, url: saved2.html_url };
+  }
+  const saved = await call("POST", `/commits/${target.sha}/comments`, { body });
+  return { on: "commit", url: saved.html_url };
+}
+
 // src/policy.ts
 var NEVER = { newHigh: false, scoreDrop: null };
 function parseFailOn(text) {
@@ -187,7 +232,36 @@ function summarize(comparison, failed) {
 // src/run.ts
 var POLL_MS = 2e4;
 var wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function run({ runner: runner2, fetch: fetchImpl = fetch, sleep = wait, now = Date.now }) {
+async function comment(runner2, env, markdown, fetchImpl) {
+  if ((runner2.input("comment") || "true").toLowerCase() === "false") return;
+  const token = runner2.input("github-token");
+  const repository = env.GITHUB_REPOSITORY;
+  const sha = env.GITHUB_SHA;
+  if (!token || !repository || !sha) {
+    runner2.warning("Not commenting: there's no GitHub token, repository or commit to comment on.");
+    return;
+  }
+  try {
+    const posted = await postComment(
+      { token, repository, sha, apiUrl: env.GITHUB_API_URL || "https://api.github.com" },
+      markdown,
+      fetchImpl
+    );
+    runner2.info(`Commented on ${posted.on === "pull" ? `pull request #${posted.number}` : "the commit"}: ${posted.url}`);
+  } catch (error) {
+    const denied = error instanceof GitHubError && (error.status === 403 || error.status === 404);
+    runner2.warning(
+      denied ? `Couldn't comment (${error.message}). Give the job \`pull-requests: write\`, and \`contents: write\` to comment on a commit with no pull request, or set comment: false.` : `Couldn't comment: ${error.message}`
+    );
+  }
+}
+async function run({
+  runner: runner2,
+  fetch: fetchImpl = fetch,
+  sleep = wait,
+  now = Date.now,
+  env = process.env
+}) {
   const key = runner2.input("api-key");
   if (!key) {
     runner2.error("api-key is empty. Pass a PersonaMark API key from a secret.");
@@ -269,7 +343,9 @@ async function run({ runner: runner2, fetch: fetchImpl = fetch, sleep = wait, no
   runner2.output("score", String(comparison.score.now));
   runner2.output("score-change", comparison.score.change === null ? "" : String(comparison.score.change));
   runner2.output("new-high", String(comparison.counts.newHigh));
-  runner2.summary(summarize(comparison, failed));
+  const markdown = summarize(comparison, failed);
+  runner2.summary(markdown);
+  await comment(runner2, env, markdown, fetchImpl);
   runner2.info(`Score ${comparison.score.now}. ${comparison.audit.url}`);
   for (const reason of failed) runner2.error(reason);
   return failed.length > 0 ? 1 : 0;

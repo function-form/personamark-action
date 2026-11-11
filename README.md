@@ -26,6 +26,9 @@ jobs:
       github.event.deployment.environment == 'Production'
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    permissions:
+      pull-requests: write # comment on the pull request the deployed commit came from
+      contents: write # or on the commit, when there's no pull request
     steps:
       - uses: function-form/personamark-action@v1
         with:
@@ -44,6 +47,8 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    permissions:
+      contents: write # a release's commit usually has no pull request, so it comments there
     steps:
       # Your deploy steps first, then:
       - uses: function-form/personamark-action@v1
@@ -62,6 +67,8 @@ is live.
 | `fail-on`         | `none`                         | `new-high` fails when a high-severity issue is new or back; `score-drop:<n>` fails when the score fell by n or more. Comma-separate both. |
 | `wait`            | `true`                         | With `false`, the step only starts the audit.                                                                                      |
 | `timeout-minutes` | `30`                           | How long to wait for the audit. The audit carries on past it, and the step passes unless `fail-on` asks for something.             |
+| `comment`         | `true`                         | Post the summary as a comment too (see below). `false` keeps it to the job summary.                                                |
+| `github-token`    | `${{ github.token }}`          | The token to comment with.                                                                                                         |
 | `base-url`        | `https://work.personamark.app` | Where PersonaMark is.                                                                                                              |
 
 If an audit is already going when the step starts, it waits for that one instead of starting
@@ -78,6 +85,11 @@ The job summary shows the score and its change, each area, and up to 10 checks e
 back or fixed, with an example page and a link to the audit in PersonaMark. A partial audit, or two
 audits scored by different rules, aren't compared, and issues you've marked intended in PersonaMark
 never count.
+
+It also posts the summary as a comment where the change's authors will see it: on the pull request
+the deployed commit came from, or on the commit itself when no pull request has it. Running again
+for the same pull request updates that comment rather than adding another. Commenting needs the
+job's `permissions` above; without them the step warns and carries on.
 
 ## Development
 

@@ -54,7 +54,9 @@ function fakeApi(start: Response, jobs: Partial<Job>[], compare: Comparison = co
   const impl = (async (url: string | URL | Request, init?: RequestInit) => {
     const path = new URL(String(url)).pathname;
     calls.push(`${init?.method ?? "GET"} ${path}`);
-    expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${KEY}`);
+    if (path.startsWith("/api/v1/")) {
+      expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${KEY}`);
+    }
     if (path === "/api/v1/audits") return start;
     if (path.startsWith("/api/v1/jobs/")) {
       const job = jobs[Math.min(read++, jobs.length - 1)];
@@ -66,10 +68,10 @@ function fakeApi(start: Response, jobs: Partial<Job>[], compare: Comparison = co
   return { impl, calls };
 }
 
-/** A clock that moves on by a poll each time the action sleeps. */
+/** A clock that moves on by a poll each time the action sleeps, outside any GitHub run. */
 function fakeClock() {
   let time = 0;
-  return { now: () => time, sleep: async (ms: number) => void (time += ms) };
+  return { now: () => time, sleep: async (ms: number) => void (time += ms), env: {} };
 }
 
 describe("run", () => {
@@ -99,6 +101,25 @@ describe("run", () => {
     });
     expect(logs).toContain("info Audit running: crawling");
     expect(summaries[0]).toContain("Score **84** (−6 since Nov 4, 2026).");
+  });
+
+  it("comments the summary, and only warns when GitHub refuses", async () => {
+    const { runner, logs } = fakeRunner({ "api-key": KEY, "github-token": "ghs_x" });
+    const api = fakeApi(json({ jobId: "job1" }, 202), [{ status: "succeeded", auditId: "a1" }]);
+    const env = { GITHUB_REPOSITORY: "acme/site", GITHUB_SHA: "abc123", GITHUB_API_URL: "https://api.github.com" };
+    const code = await run({ runner, fetch: api.impl, ...fakeClock(), env });
+    expect(code).toBe(0);
+    expect(api.calls).toContain("GET /repos/acme/site/commits/abc123/pulls");
+    expect(logs.some((line) => line.startsWith("warning Couldn't comment") && line.includes("pull-requests: write"))).toBe(true);
+  });
+
+  it("doesn't comment when told not to", async () => {
+    const { runner, logs } = fakeRunner({ "api-key": KEY, "github-token": "ghs_x", comment: "false" });
+    const api = fakeApi(json({ jobId: "job1" }, 202), [{ status: "succeeded", auditId: "a1" }]);
+    const env = { GITHUB_REPOSITORY: "acme/site", GITHUB_SHA: "abc123" };
+    expect(await run({ runner, fetch: api.impl, ...fakeClock(), env })).toBe(0);
+    expect(api.calls.some((call) => call.includes("/repos/"))).toBe(false);
+    expect(logs.some((line) => line.startsWith("warning"))).toBe(false);
   });
 
   it("waits on the audit already going instead of failing", async () => {

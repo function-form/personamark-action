@@ -1,5 +1,6 @@
 import type { Runner } from "./actions.ts";
 import { PersonaMark, type Job } from "./api.ts";
+import { GitHubError, postComment } from "./comment.ts";
 import { failsOnSomething, failures, parseFailOn } from "./policy.ts";
 import { summarize } from "./summary.ts";
 
@@ -10,12 +11,50 @@ export interface Deps {
   fetch?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
+  /** The runner's environment, for the repository and commit to comment on. */
+  env?: NodeJS.ProcessEnv;
 }
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Comments the summary on the deployed commit's pull request, or the commit. A comment is a
+ * convenience, so failing to post one only warns, with what the job's permissions need.
+ */
+async function comment(runner: Runner, env: NodeJS.ProcessEnv, markdown: string, fetchImpl: typeof fetch) {
+  if ((runner.input("comment") || "true").toLowerCase() === "false") return;
+  const token = runner.input("github-token");
+  const repository = env.GITHUB_REPOSITORY;
+  const sha = env.GITHUB_SHA;
+  if (!token || !repository || !sha) {
+    runner.warning("Not commenting: there's no GitHub token, repository or commit to comment on.");
+    return;
+  }
+  try {
+    const posted = await postComment(
+      { token, repository, sha, apiUrl: env.GITHUB_API_URL || "https://api.github.com" },
+      markdown,
+      fetchImpl,
+    );
+    runner.info(`Commented on ${posted.on === "pull" ? `pull request #${posted.number}` : "the commit"}: ${posted.url}`);
+  } catch (error) {
+    const denied = error instanceof GitHubError && (error.status === 403 || error.status === 404);
+    runner.warning(
+      denied
+        ? `Couldn't comment (${error.message}). Give the job \`pull-requests: write\`, and \`contents: write\` to comment on a commit with no pull request, or set comment: false.`
+        : `Couldn't comment: ${(error as Error).message}`,
+    );
+  }
+}
+
 /** Runs the action. Returns the exit code: 0 passed, 1 failed. */
-export async function run({ runner, fetch: fetchImpl = fetch, sleep = wait, now = Date.now }: Deps): Promise<number> {
+export async function run({
+  runner,
+  fetch: fetchImpl = fetch,
+  sleep = wait,
+  now = Date.now,
+  env = process.env,
+}: Deps): Promise<number> {
   const key = runner.input("api-key");
   if (!key) {
     runner.error("api-key is empty. Pass a PersonaMark API key from a secret.");
@@ -103,7 +142,9 @@ export async function run({ runner, fetch: fetchImpl = fetch, sleep = wait, now 
   runner.output("score", String(comparison.score.now));
   runner.output("score-change", comparison.score.change === null ? "" : String(comparison.score.change));
   runner.output("new-high", String(comparison.counts.newHigh));
-  runner.summary(summarize(comparison, failed));
+  const markdown = summarize(comparison, failed);
+  runner.summary(markdown);
+  await comment(runner, env, markdown, fetchImpl);
   runner.info(`Score ${comparison.score.now}. ${comparison.audit.url}`);
   for (const reason of failed) runner.error(reason);
   return failed.length > 0 ? 1 : 0;
