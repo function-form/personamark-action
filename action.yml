@@ -18,6 +18,14 @@ inputs:
   timeout-minutes:
     description: How long to wait for the audit before giving up on it. The audit itself carries on.
     default: "30"
+  comment:
+    description: >-
+      Post the summary as a comment on the pull request the deployed commit came from, or on the
+      commit when there's none. A re-run updates its own pull request comment.
+    default: "true"
+  github-token:
+    description: The token to comment with. Needs `pull-requests: write` (and `contents: write` for commit comments).
+    default: ${{ github.token }}
   fail-on:
     description: >-
       When to fail the step: `none`, `new-high` (an issue of high severity is new or back), or
