@@ -59,6 +59,42 @@ jobs:
 The audit covers the site's verified domain as it is when the step runs, so run it once the deploy
 is live.
 
+### Before merging: audit a Vercel preview
+
+With `preview-url`, the action audits a pull request's preview deployment instead, and compares it
+with your latest production audit, so the pull request says what it would do to the score before
+it merges. First, in PersonaMark's **Settings** › **Crawling**, an owner allows your preview hosts
+(like `*-yourteam.vercel.app`) and, if your previews are protected, stores Vercel's Protection
+Bypass for Automation secret. Your previews must carry the site's verification meta tag.
+
+```yaml
+name: PersonaMark preview audit
+
+on:
+  deployment_status:
+
+jobs:
+  preview:
+    if: >-
+      github.event.deployment_status.state == 'success' &&
+      github.event.deployment.environment != 'Production'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: function-form/personamark-action@v1
+        with:
+          api-key: ${{ secrets.PERSONAMARK_API_KEY }}
+          preview-url: ${{ github.event.deployment_status.environment_url }}
+          ref: ${{ github.event.deployment.ref }}
+          fail-on: new-high
+```
+
+The comment goes on the pull request the preview's commit belongs to, and a new deploy of the same
+pull request updates it. Both scores leave out PageSpeed, which can't reach a protected preview, so
+the production score in the comment can differ from your latest audit's.
+
 ## Inputs
 
 | Input             | Default                        | What it does                                                                                                                       |
@@ -69,6 +105,9 @@ is live.
 | `timeout-minutes` | `30`                           | How long to wait for the audit. The audit carries on past it, and the step passes unless `fail-on` asks for something.             |
 | `comment`         | `true`                         | Post the summary as a comment too (see below). `false` keeps it to the job summary.                                                |
 | `github-token`    | `${{ github.token }}`          | The token to comment with.                                                                                                         |
+| `preview-url`     |                                | A preview deployment to audit and compare with production, instead of the site.                                                    |
+| `ref`             | the PR's head branch           | Labels a preview audit with its branch.                                                                                            |
+| `pull-request`    |                                | Labels a preview audit with its pull request's number.                                                                             |
 | `base-url`        | `https://work.personamark.app` | Where PersonaMark is.                                                                                                              |
 
 If an audit is already going when the step starts, it waits for that one instead of starting
@@ -76,7 +115,7 @@ another. A key can start 24 audits a day.
 
 ## Outputs
 
-`job-id`, `audit-id`, `audit-url`, `score`, `score-change` (empty when the two audits can't be
+`job-id` (or `preview-id`), `audit-id`, `audit-url`, `score`, `score-change` (empty when the two audits can't be
 compared, such as when the scoring rules changed), and `new-high`.
 
 ## What it reports

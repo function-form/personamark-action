@@ -8,8 +8,8 @@ export interface CheckGroup {
   urls: string[];
 }
 
-export interface Comparison {
-  audit: { id: string; createdAt: string; score: number; partial: boolean; capped: boolean; url: string };
+/** What a comparison holds, for an audit of the site or for a preview. */
+export interface ComparisonCore {
   comparedWith: { id: string; createdAt: string } | null;
   score: { now: number; before: number | null; change: number | null };
   areas: { area: string; label: string; now: number | null; before: number | null; change: number | null }[];
@@ -18,6 +18,43 @@ export interface Comparison {
   new: CheckGroup[];
   regressed: CheckGroup[];
   fixed: CheckGroup[];
+}
+
+export interface Comparison extends ComparisonCore {
+  audit: { id: string; createdAt: string; score: number; partial: boolean; capped: boolean; url: string };
+}
+
+export interface PreviewComparison extends ComparisonCore {
+  preview: {
+    id: string;
+    createdAt: string;
+    previewOrigin: string;
+    ref: string | null;
+    sha: string | null;
+    pullRequest: number | null;
+    partial: boolean;
+    capped: boolean;
+  };
+  /** The production audit it was compared with, in PersonaMark. */
+  productionAuditUrl: string | null;
+}
+
+export interface Preview {
+  id: string;
+  jobId: string;
+  status: Job["status"];
+  stage: string | null;
+  stalled: boolean;
+  error: string | null;
+  score: number | null;
+  productionScore: number | null;
+}
+
+export interface PreviewRequest {
+  url: string;
+  ref?: string;
+  sha?: string;
+  pull_request?: number;
 }
 
 export interface Job {
@@ -51,10 +88,15 @@ export class PersonaMark {
     this.#base = `${baseUrl.replace(/\/+$/, "")}/api/v1`;
   }
 
-  async #request<T>(method: "GET" | "POST", path: string): Promise<T> {
+  async #request<T>(method: "GET" | "POST", path: string, data?: unknown): Promise<T> {
     const response = await this.fetchImpl(`${this.#base}${path}`, {
       method,
-      headers: { authorization: `Bearer ${this.key}`, accept: "application/json" },
+      headers: {
+        authorization: `Bearer ${this.key}`,
+        accept: "application/json",
+        ...(data === undefined ? {} : { "content-type": "application/json" }),
+      },
+      ...(data === undefined ? {} : { body: JSON.stringify(data) }),
     });
     const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
     if (!response.ok) {
@@ -83,5 +125,26 @@ export class PersonaMark {
 
   compare(auditId: string): Promise<Comparison> {
     return this.#request("GET", `/audits/${encodeURIComponent(auditId)}/compare`);
+  }
+
+  /** Starts a preview audit, or joins the one of the same preview already going. */
+  async startPreview(request: PreviewRequest): Promise<{ previewId: string; joined: boolean }> {
+    try {
+      const { previewId } = await this.#request<{ previewId: string }>("POST", "/previews", request);
+      return { previewId, joined: false };
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409 && typeof error.body.previewId === "string") {
+        return { previewId: error.body.previewId, joined: true };
+      }
+      throw error;
+    }
+  }
+
+  preview(previewId: string): Promise<Preview> {
+    return this.#request("GET", `/previews/${encodeURIComponent(previewId)}`);
+  }
+
+  comparePreview(previewId: string): Promise<PreviewComparison> {
+    return this.#request("GET", `/previews/${encodeURIComponent(previewId)}/compare`);
   }
 }

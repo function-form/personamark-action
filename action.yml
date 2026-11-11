@@ -12,6 +12,17 @@ inputs:
   base-url:
     description: Where PersonaMark is.
     default: https://work.personamark.app
+  preview-url:
+    description: >-
+      A pull request's preview deployment to audit and compare with production, instead of auditing
+      the site. It must be on one of the site's preview hosts (Settings › Crawling).
+    default: ""
+  ref:
+    description: The branch, to label a preview audit. Defaults to the pull request's head branch.
+    default: ""
+  pull-request:
+    description: The pull request's number, to label a preview audit.
+    default: ""
   wait:
     description: Wait for the audit to finish and report on it. With false, the step only starts it.
     default: "true"
@@ -35,10 +46,12 @@ inputs:
 outputs:
   job-id:
     description: The audit job's id.
+  preview-id:
+    description: The preview audit's id, with preview-url.
   audit-id:
     description: The audit's id, once it finished.
   audit-url:
-    description: The audit in PersonaMark.
+    description: The audit in PersonaMark, or with preview-url the production audit it was compared with.
   score:
     description: The audit's score, 0 to 100.
   score-change:

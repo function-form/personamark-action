@@ -1,8 +1,8 @@
 import type { Runner } from "./actions.ts";
-import { PersonaMark, type Job } from "./api.ts";
+import { PersonaMark, type ComparisonCore, type Job } from "./api.ts";
 import { GitHubError, postComment } from "./comment.ts";
 import { failsOnSomething, failures, parseFailOn } from "./policy.ts";
-import { summarize } from "./summary.ts";
+import { summarize, summarizePreview } from "./summary.ts";
 
 export const POLL_MS = 20_000;
 
@@ -16,6 +16,16 @@ export interface Deps {
 }
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+const FINISHED: readonly Job["status"][] = ["succeeded", "failed", "cancelled"];
+
+/** Where something is: a job or a preview, polled the same way. */
+interface Progress {
+  status: Job["status"];
+  stage: string | null;
+  stalled: boolean;
+  error: string | null;
+}
 
 /**
  * Comments the summary on the deployed commit's pull request, or the commit. A comment is a
@@ -63,6 +73,8 @@ export async function run({
   const baseUrl = runner.input("base-url") || "https://work.personamark.app";
   const shouldWait = (runner.input("wait") || "true").toLowerCase() !== "false";
   const timeoutMinutes = Number(runner.input("timeout-minutes") || "30");
+  const previewUrl = runner.input("preview-url");
+  const pullRequest = runner.input("pull-request");
   let rules;
   try {
     rules = parseFailOn(runner.input("fail-on") || "none");
@@ -74,6 +86,11 @@ export async function run({
     runner.error("timeout-minutes must be a positive number.");
     return 1;
   }
+  if (pullRequest && !/^[1-9]\d{0,9}$/.test(pullRequest)) {
+    runner.error("pull-request must be a pull request's number.");
+    return 1;
+  }
+  const what = previewUrl ? "preview audit" : "audit";
   // When the result can't be checked, the step passes unless something was asked of it.
   const unchecked = (message: string) => {
     if (failsOnSomething(rules)) {
@@ -85,67 +102,104 @@ export async function run({
   };
 
   const api = new PersonaMark(baseUrl, key, fetchImpl);
-  let jobId: string;
+
+  // Starting: a production audit, or a preview labelled with the commit and branch it came from.
+  let id: string;
+  let poll: () => Promise<Progress>;
   try {
-    const started = await api.startAudit();
-    jobId = started.jobId;
-    runner.info(started.joined ? `An audit was already going; waiting on it (${jobId}).` : `Started an audit (${jobId}).`);
+    if (previewUrl) {
+      const ref = runner.input("ref") || env.GITHUB_HEAD_REF || "";
+      const sha = env.GITHUB_SHA ?? "";
+      const started = await api.startPreview({
+        url: previewUrl,
+        ...(ref ? { ref } : {}),
+        ...(/^[0-9a-f]{7,40}$/.test(sha) ? { sha } : {}),
+        ...(pullRequest ? { pull_request: Number(pullRequest) } : {}),
+      });
+      id = started.previewId;
+      poll = () => api.preview(id);
+      runner.output("preview-id", id);
+      runner.info(started.joined ? `This preview was already being audited; waiting on it (${id}).` : `Started a preview audit (${id}).`);
+    } else {
+      const started = await api.startAudit();
+      id = started.jobId;
+      poll = () => api.job(id);
+      runner.output("job-id", id);
+      runner.info(started.joined ? `An audit was already going; waiting on it (${id}).` : `Started an audit (${id}).`);
+    }
   } catch (error) {
-    runner.error(`Could not start an audit: ${(error as Error).message}`);
+    runner.error(`Could not start the ${what}: ${(error as Error).message}`);
     return 1;
   }
-  runner.output("job-id", jobId);
   if (!shouldWait) return 0;
 
   const deadline = now() + timeoutMinutes * 60_000;
-  let job: Job | null = null;
+  let progress: Progress | null = null;
   let said = "";
   let warnedStalled = false;
   while (now() < deadline) {
     try {
-      job = await api.job(jobId);
+      progress = await poll();
     } catch (error) {
       // A blip shouldn't end a half-hour wait; a refused key or a missing job should.
       const status = (error as { status?: number }).status;
       if (status === 401 || status === 404) {
-        runner.error(`Could not follow the audit: ${(error as Error).message}`);
+        runner.error(`Could not follow the ${what}: ${(error as Error).message}`);
         return 1;
       }
-      runner.info(`Could not read the audit's progress (${(error as Error).message}); trying again.`);
+      runner.info(`Could not read the ${what}'s progress (${(error as Error).message}); trying again.`);
     }
-    if (job) {
-      const progress = job.stage ? `${job.status}: ${job.stage}` : job.status;
-      if (progress !== said) runner.info(`Audit ${progress}`);
-      said = progress;
-      if (job.stalled && !warnedStalled) {
-        runner.info("The audit has been queued for a while; PersonaMark's worker may be busy or off.");
+    if (progress) {
+      const line = progress.stage ? `${progress.status}: ${progress.stage}` : progress.status;
+      if (line !== said) runner.info(`${previewUrl ? "Preview audit" : "Audit"} ${line}`);
+      said = line;
+      if (progress.stalled && !warnedStalled) {
+        runner.info(`The ${what} has been queued for a while; PersonaMark's worker may be busy or off.`);
         warnedStalled = true;
       }
-      if (["succeeded", "failed", "cancelled"].includes(job.status)) break;
+      if (FINISHED.includes(progress.status)) break;
     }
     await sleep(POLL_MS);
   }
 
-  if (!job || !["succeeded", "failed", "cancelled"].includes(job.status)) {
+  if (!progress || !FINISHED.includes(progress.status)) {
     return unchecked(
-      `The audit didn't finish within ${timeoutMinutes} minutes${job?.status === "queued" ? " and is still queued, so PersonaMark's worker may be off" : ""}. It carries on, and its results will be in PersonaMark.`,
+      `The ${what} didn't finish within ${timeoutMinutes} minutes${progress?.status === "queued" ? " and is still queued, so PersonaMark's worker may be off" : ""}. It carries on, and its results will be in PersonaMark.`,
     );
   }
-  if (job.status !== "succeeded" || !job.auditId) {
-    return unchecked(`The audit ${job.status === "cancelled" ? "was cancelled" : `failed: ${job.error ?? "no reason given"}`}.`);
+  if (progress.status !== "succeeded") {
+    return unchecked(
+      `The ${what} ${progress.status === "cancelled" ? "was cancelled" : `failed: ${progress.error ?? "no reason given"}`}.`,
+    );
   }
 
-  const comparison = await api.compare(job.auditId);
-  const failed = failures(comparison, rules);
-  runner.output("audit-id", comparison.audit.id);
-  runner.output("audit-url", comparison.audit.url);
+  let comparison: ComparisonCore;
+  let markdown: string;
+  let link: string | null;
+  const failed: string[] = [];
+  if (previewUrl) {
+    const compared = await api.comparePreview(id);
+    failed.push(...failures(compared, rules));
+    comparison = compared;
+    markdown = summarizePreview(compared, failed);
+    link = compared.productionAuditUrl;
+  } else {
+    const job = progress as Job;
+    if (!job.auditId) return unchecked("The audit finished without saving one.");
+    const compared = await api.compare(job.auditId);
+    failed.push(...failures(compared, rules));
+    comparison = compared;
+    markdown = summarize(compared, failed);
+    link = compared.audit.url;
+    runner.output("audit-id", compared.audit.id);
+  }
+  if (link) runner.output("audit-url", link);
   runner.output("score", String(comparison.score.now));
   runner.output("score-change", comparison.score.change === null ? "" : String(comparison.score.change));
   runner.output("new-high", String(comparison.counts.newHigh));
-  const markdown = summarize(comparison, failed);
   runner.summary(markdown);
   await comment(runner, env, markdown, fetchImpl);
-  runner.info(`Score ${comparison.score.now}. ${comparison.audit.url}`);
+  runner.info(`Score ${comparison.score.now}.${link ? ` ${link}` : ""}`);
   for (const reason of failed) runner.error(reason);
   return failed.length > 0 ? 1 : 0;
 }
