@@ -164,7 +164,7 @@ describe("run", () => {
     const { runner, logs } = fakeRunner({ "api-key": KEY });
     const api = fakeApi(json({ error: "Send a live API key." }, 401), []);
     expect(await run({ runner, fetch: api.impl, ...fakeClock() })).toBe(1);
-    expect(logs).toEqual(["error Could not start an audit: Send a live API key."]);
+    expect(logs).toEqual(["error Could not start the audit: Send a live API key."]);
   });
 
   it("refuses an empty key and a fail-on it doesn't understand", async () => {
@@ -202,5 +202,92 @@ describe("summarize", () => {
     expect(
       summarize(comparison({ score: { now: 84, before: 90, change: null } }), []),
     ).toContain("scored by different rules");
+  });
+});
+
+describe("run with a preview-url", () => {
+  const previewComparison = {
+    ...comparison(),
+    audit: undefined,
+    preview: {
+      id: "p1",
+      createdAt: "2026-11-11T00:00:00Z",
+      previewOrigin: "https://site-git-x-acme.vercel.app",
+      ref: "feat/x",
+      sha: "abc1234def",
+      pullRequest: 12,
+      partial: false,
+      capped: false,
+    },
+    productionAuditUrl: AUDIT_URL,
+    score: { now: 80, before: 96, change: -16 },
+  };
+
+  /** A fake PersonaMark for previews: the start answer, then each preview read, then the comparison. */
+  function fakePreviewApi(start: Response, reads: Record<string, unknown>[]) {
+    const calls: { call: string; body?: unknown }[] = [];
+    let read = 0;
+    const impl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const path = new URL(String(url)).pathname;
+      calls.push({
+        call: `${init?.method ?? "GET"} ${path}`,
+        ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}),
+      });
+      if (path === "/api/v1/previews") return start;
+      if (path === "/api/v1/previews/p1") {
+        const state = reads[Math.min(read++, reads.length - 1)];
+        return json({ id: "p1", jobId: "j1", stage: null, stalled: false, error: null, ...state });
+      }
+      if (path === "/api/v1/previews/p1/compare") return json(previewComparison);
+      return json({ error: "nope" }, 404);
+    }) as typeof fetch;
+    return { impl, calls };
+  }
+
+  it("audits the preview, labelled with the commit, and compares it with production", async () => {
+    const { runner, outputs, summaries } = fakeRunner({
+      "api-key": KEY,
+      "preview-url": "https://site-git-x-acme.vercel.app/",
+      "pull-request": "12",
+      "fail-on": "score-drop:10",
+    });
+    const api = fakePreviewApi(json({ previewId: "p1", jobId: "j1" }, 202), [
+      { status: "running", stage: "crawling" },
+      { status: "succeeded", score: 80 },
+    ]);
+    const env = { GITHUB_SHA: "abc1234def", GITHUB_HEAD_REF: "feat/x" };
+    const code = await run({ runner, fetch: api.impl, ...fakeClock(), env });
+    expect(code).toBe(1);
+    expect(api.calls[0]).toEqual({
+      call: "POST /api/v1/previews",
+      body: { url: "https://site-git-x-acme.vercel.app/", ref: "feat/x", sha: "abc1234def", pull_request: 12 },
+    });
+    expect(outputs).toMatchObject({ "preview-id": "p1", score: "80", "score-change": "-16", "audit-url": AUDIT_URL });
+    expect(summaries[0]).toContain("PersonaMark preview audit of #12 · feat/x · abc1234");
+    expect(summaries[0]).toContain("−16 against production's 96");
+  });
+
+  it("waits on the same preview when it's already being audited", async () => {
+    const { runner, logs } = fakeRunner({ "api-key": KEY, "preview-url": "https://x-acme.vercel.app" });
+    const api = fakePreviewApi(
+      json({ error: "This preview is already being audited.", previewId: "p1", jobId: "j1" }, 409),
+      [{ status: "succeeded", score: 80 }],
+    );
+    expect(await run({ runner, fetch: api.impl, ...fakeClock() })).toBe(0);
+    expect(logs[0]).toBe("info This preview was already being audited; waiting on it (p1).");
+  });
+
+  it("fails with PersonaMark's reason for a host the site didn't allow", async () => {
+    const { runner, logs } = fakeRunner({ "api-key": KEY, "preview-url": "https://elsewhere.example" });
+    const api = fakePreviewApi(json({ error: "That URL isn't https on one of this site's preview hosts." }, 422), []);
+    expect(await run({ runner, fetch: api.impl, ...fakeClock() })).toBe(1);
+    expect(logs).toEqual([
+      "error Could not start the preview audit: That URL isn't https on one of this site's preview hosts.",
+    ]);
+  });
+
+  it("refuses a pull-request that isn't a number", async () => {
+    const { runner } = fakeRunner({ "api-key": KEY, "preview-url": "https://x-acme.vercel.app", "pull-request": "twelve" });
+    expect(await run({ runner })).toBe(1);
   });
 });

@@ -1,4 +1,4 @@
-import type { Comparison } from "./api.ts";
+import type { ComparisonCore } from "./api.ts";
 
 /** When the step fails, from the `fail-on` input. */
 export interface FailOn {
@@ -33,7 +33,7 @@ export function parseFailOn(text: string): FailOn {
 export const failsOnSomething = (rules: FailOn) => rules.newHigh || rules.scoreDrop !== null;
 
 /** Why the step fails for this comparison, or nothing when it passes. */
-export function failures(comparison: Comparison, rules: FailOn): string[] {
+export function failures(comparison: ComparisonCore, rules: FailOn): string[] {
   const reasons: string[] = [];
   const { newHigh } = comparison.counts;
   if (rules.newHigh && newHigh > 0) {

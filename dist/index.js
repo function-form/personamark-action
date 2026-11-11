@@ -46,10 +46,15 @@ var PersonaMark = class {
   key;
   fetchImpl;
   #base;
-  async #request(method, path) {
+  async #request(method, path, data) {
     const response = await this.fetchImpl(`${this.#base}${path}`, {
       method,
-      headers: { authorization: `Bearer ${this.key}`, accept: "application/json" }
+      headers: {
+        authorization: `Bearer ${this.key}`,
+        accept: "application/json",
+        ...data === void 0 ? {} : { "content-type": "application/json" }
+      },
+      ...data === void 0 ? {} : { body: JSON.stringify(data) }
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -75,6 +80,24 @@ var PersonaMark = class {
   }
   compare(auditId) {
     return this.#request("GET", `/audits/${encodeURIComponent(auditId)}/compare`);
+  }
+  /** Starts a preview audit, or joins the one of the same preview already going. */
+  async startPreview(request) {
+    try {
+      const { previewId } = await this.#request("POST", "/previews", request);
+      return { previewId, joined: false };
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409 && typeof error.body.previewId === "string") {
+        return { previewId: error.body.previewId, joined: true };
+      }
+      throw error;
+    }
+  }
+  preview(previewId) {
+    return this.#request("GET", `/previews/${encodeURIComponent(previewId)}`);
+  }
+  comparePreview(previewId) {
+    return this.#request("GET", `/previews/${encodeURIComponent(previewId)}/compare`);
   }
 };
 
@@ -165,14 +188,21 @@ var date = (iso) => new Intl.DateTimeFormat("en-US", { month: "short", day: "num
 );
 var signed = (change) => change > 0 ? `+${change}` : change < 0 ? `\u2212${-change}` : "\xB10";
 var cell = (text) => text.replaceAll("|", "\\|").replaceAll(/[\r\n]+/g, " ");
-function headline(comparison) {
-  const { score, comparedWith, audit } = comparison;
-  if (audit.partial) return `Score **${score.now}**, from a partial audit, so it isn't compared.`;
+function auditHeadline({ score, comparedWith }) {
   if (!comparedWith) return `Score **${score.now}**. This is the site's first complete audit.`;
   if (score.change === null) {
     return `Score **${score.now}**. The audit of ${date(comparedWith.createdAt)} was scored by different rules, so the two don't compare.`;
   }
   return `Score **${score.now}** (${signed(score.change)} since ${date(comparedWith.createdAt)}).`;
+}
+function previewHeadline({ score, comparedWith }) {
+  if (!comparedWith || score.before === null) {
+    return `Score **${score.now}**. There's no complete production audit to compare with yet.`;
+  }
+  if (score.change === null) {
+    return `Score **${score.now}**, against production's ${score.before}. The two were scored by different rules, so they don't compare.`;
+  }
+  return `Score **${score.now}**, ${signed(score.change)} against production's ${score.before} (the audit of ${date(comparedWith.createdAt)}). Both leave out PageSpeed, which can't reach a preview.`;
 }
 function checkTable(title, groups, withExample) {
   if (groups.length === 0) return [];
@@ -191,13 +221,13 @@ function checkTable(title, groups, withExample) {
     ``
   ];
 }
-function summarize(comparison, failed) {
+function render(comparison, failed, view) {
   const { counts } = comparison;
   const areas = comparison.areas.filter((row) => row.now !== null || row.before !== null);
   const lines = [
-    `## PersonaMark audit`,
+    `## ${view.title}`,
     ``,
-    headline(comparison),
+    view.partial ? `Score **${comparison.score.now}**, from a partial audit, so it isn't compared.` : view.headline(comparison),
     ``,
     ...failed.map((reason) => `> [!CAUTION]
 > ${reason}
@@ -221,17 +251,40 @@ function summarize(comparison, failed) {
   );
   if (comparison.changedChecks.length > 0 && comparison.comparedWith) {
     lines.push(
-      `Some checks changed since the audit before, so what they found isn't called new or fixed.`,
+      `Some checks changed since the audit compared with, so what they found isn't called new or fixed.`,
       ``
     );
   }
-  lines.push(`[Open the audit in PersonaMark](${comparison.audit.url})`);
+  if (view.link) lines.push(`[${view.link.label}](${view.link.url})`);
   return lines.join("\n");
+}
+function summarize(comparison, failed) {
+  return render(comparison, failed, {
+    title: "PersonaMark audit",
+    partial: comparison.audit.partial,
+    headline: auditHeadline,
+    link: { label: "Open the audit in PersonaMark", url: comparison.audit.url }
+  });
+}
+function summarizePreview(comparison, failed) {
+  const { preview } = comparison;
+  const what = [
+    preview.pullRequest === null ? null : `#${preview.pullRequest}`,
+    preview.ref,
+    preview.sha?.slice(0, 7) ?? null
+  ].filter((part) => part !== null);
+  return render(comparison, failed, {
+    title: `PersonaMark preview audit${what.length > 0 ? ` of ${what.join(" \xB7 ")}` : ""}`,
+    partial: preview.partial,
+    headline: previewHeadline,
+    link: comparison.productionAuditUrl ? { label: "Open the production audit in PersonaMark", url: comparison.productionAuditUrl } : null
+  });
 }
 
 // src/run.ts
 var POLL_MS = 2e4;
 var wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var FINISHED = ["succeeded", "failed", "cancelled"];
 async function comment(runner2, env, markdown, fetchImpl) {
   if ((runner2.input("comment") || "true").toLowerCase() === "false") return;
   const token = runner2.input("github-token");
@@ -270,6 +323,8 @@ async function run({
   const baseUrl = runner2.input("base-url") || "https://work.personamark.app";
   const shouldWait = (runner2.input("wait") || "true").toLowerCase() !== "false";
   const timeoutMinutes = Number(runner2.input("timeout-minutes") || "30");
+  const previewUrl = runner2.input("preview-url");
+  const pullRequest = runner2.input("pull-request");
   let rules;
   try {
     rules = parseFailOn(runner2.input("fail-on") || "none");
@@ -281,6 +336,11 @@ async function run({
     runner2.error("timeout-minutes must be a positive number.");
     return 1;
   }
+  if (pullRequest && !/^[1-9]\d{0,9}$/.test(pullRequest)) {
+    runner2.error("pull-request must be a pull request's number.");
+    return 1;
+  }
+  const what = previewUrl ? "preview audit" : "audit";
   const unchecked = (message) => {
     if (failsOnSomething(rules)) {
       runner2.error(message);
@@ -290,63 +350,98 @@ async function run({
     return 0;
   };
   const api = new PersonaMark(baseUrl, key, fetchImpl);
-  let jobId;
+  let id;
+  let poll;
   try {
-    const started = await api.startAudit();
-    jobId = started.jobId;
-    runner2.info(started.joined ? `An audit was already going; waiting on it (${jobId}).` : `Started an audit (${jobId}).`);
+    if (previewUrl) {
+      const ref = runner2.input("ref") || env.GITHUB_HEAD_REF || "";
+      const sha = env.GITHUB_SHA ?? "";
+      const started = await api.startPreview({
+        url: previewUrl,
+        ...ref ? { ref } : {},
+        .../^[0-9a-f]{7,40}$/.test(sha) ? { sha } : {},
+        ...pullRequest ? { pull_request: Number(pullRequest) } : {}
+      });
+      id = started.previewId;
+      poll = () => api.preview(id);
+      runner2.output("preview-id", id);
+      runner2.info(started.joined ? `This preview was already being audited; waiting on it (${id}).` : `Started a preview audit (${id}).`);
+    } else {
+      const started = await api.startAudit();
+      id = started.jobId;
+      poll = () => api.job(id);
+      runner2.output("job-id", id);
+      runner2.info(started.joined ? `An audit was already going; waiting on it (${id}).` : `Started an audit (${id}).`);
+    }
   } catch (error) {
-    runner2.error(`Could not start an audit: ${error.message}`);
+    runner2.error(`Could not start the ${what}: ${error.message}`);
     return 1;
   }
-  runner2.output("job-id", jobId);
   if (!shouldWait) return 0;
   const deadline = now() + timeoutMinutes * 6e4;
-  let job = null;
+  let progress = null;
   let said = "";
   let warnedStalled = false;
   while (now() < deadline) {
     try {
-      job = await api.job(jobId);
+      progress = await poll();
     } catch (error) {
       const status = error.status;
       if (status === 401 || status === 404) {
-        runner2.error(`Could not follow the audit: ${error.message}`);
+        runner2.error(`Could not follow the ${what}: ${error.message}`);
         return 1;
       }
-      runner2.info(`Could not read the audit's progress (${error.message}); trying again.`);
+      runner2.info(`Could not read the ${what}'s progress (${error.message}); trying again.`);
     }
-    if (job) {
-      const progress = job.stage ? `${job.status}: ${job.stage}` : job.status;
-      if (progress !== said) runner2.info(`Audit ${progress}`);
-      said = progress;
-      if (job.stalled && !warnedStalled) {
-        runner2.info("The audit has been queued for a while; PersonaMark's worker may be busy or off.");
+    if (progress) {
+      const line = progress.stage ? `${progress.status}: ${progress.stage}` : progress.status;
+      if (line !== said) runner2.info(`${previewUrl ? "Preview audit" : "Audit"} ${line}`);
+      said = line;
+      if (progress.stalled && !warnedStalled) {
+        runner2.info(`The ${what} has been queued for a while; PersonaMark's worker may be busy or off.`);
         warnedStalled = true;
       }
-      if (["succeeded", "failed", "cancelled"].includes(job.status)) break;
+      if (FINISHED.includes(progress.status)) break;
     }
     await sleep(POLL_MS);
   }
-  if (!job || !["succeeded", "failed", "cancelled"].includes(job.status)) {
+  if (!progress || !FINISHED.includes(progress.status)) {
     return unchecked(
-      `The audit didn't finish within ${timeoutMinutes} minutes${job?.status === "queued" ? " and is still queued, so PersonaMark's worker may be off" : ""}. It carries on, and its results will be in PersonaMark.`
+      `The ${what} didn't finish within ${timeoutMinutes} minutes${progress?.status === "queued" ? " and is still queued, so PersonaMark's worker may be off" : ""}. It carries on, and its results will be in PersonaMark.`
     );
   }
-  if (job.status !== "succeeded" || !job.auditId) {
-    return unchecked(`The audit ${job.status === "cancelled" ? "was cancelled" : `failed: ${job.error ?? "no reason given"}`}.`);
+  if (progress.status !== "succeeded") {
+    return unchecked(
+      `The ${what} ${progress.status === "cancelled" ? "was cancelled" : `failed: ${progress.error ?? "no reason given"}`}.`
+    );
   }
-  const comparison = await api.compare(job.auditId);
-  const failed = failures(comparison, rules);
-  runner2.output("audit-id", comparison.audit.id);
-  runner2.output("audit-url", comparison.audit.url);
+  let comparison;
+  let markdown;
+  let link;
+  const failed = [];
+  if (previewUrl) {
+    const compared = await api.comparePreview(id);
+    failed.push(...failures(compared, rules));
+    comparison = compared;
+    markdown = summarizePreview(compared, failed);
+    link = compared.productionAuditUrl;
+  } else {
+    const job = progress;
+    if (!job.auditId) return unchecked("The audit finished without saving one.");
+    const compared = await api.compare(job.auditId);
+    failed.push(...failures(compared, rules));
+    comparison = compared;
+    markdown = summarize(compared, failed);
+    link = compared.audit.url;
+    runner2.output("audit-id", compared.audit.id);
+  }
+  if (link) runner2.output("audit-url", link);
   runner2.output("score", String(comparison.score.now));
   runner2.output("score-change", comparison.score.change === null ? "" : String(comparison.score.change));
   runner2.output("new-high", String(comparison.counts.newHigh));
-  const markdown = summarize(comparison, failed);
   runner2.summary(markdown);
   await comment(runner2, env, markdown, fetchImpl);
-  runner2.info(`Score ${comparison.score.now}. ${comparison.audit.url}`);
+  runner2.info(`Score ${comparison.score.now}.${link ? ` ${link}` : ""}`);
   for (const reason of failed) runner2.error(reason);
   return failed.length > 0 ? 1 : 0;
 }
