@@ -1,0 +1,43 @@
+name: PersonaMark audit
+description: Audit your site's SEO after a deploy and report what changed since the audit before.
+author: function-form
+branding:
+  icon: activity
+  color: blue
+
+inputs:
+  api-key:
+    description: A PersonaMark API key for the site (Settings › API). Pass it from a secret.
+    required: true
+  base-url:
+    description: Where PersonaMark is.
+    default: https://work.personamark.app
+  wait:
+    description: Wait for the audit to finish and report on it. With false, the step only starts it.
+    default: "true"
+  timeout-minutes:
+    description: How long to wait for the audit before giving up on it. The audit itself carries on.
+    default: "30"
+  fail-on:
+    description: >-
+      When to fail the step: `none`, `new-high` (an issue of high severity is new or back), or
+      `score-drop:<n>` (the score fell by n or more). Several, comma-separated.
+    default: none
+
+outputs:
+  job-id:
+    description: The audit job's id.
+  audit-id:
+    description: The audit's id, once it finished.
+  audit-url:
+    description: The audit in PersonaMark.
+  score:
+    description: The audit's score, 0 to 100.
+  score-change:
+    description: The change since the audit before, empty when the two can't be compared.
+  new-high:
+    description: How many issues of high severity are new or back.
+
+runs:
+  using: node24
+  main: dist/index.js

@@ -1,0 +1,7 @@
+# esbuild's postinstall only checks that the platform binary, an optional dependency pnpm installs
+# anyway, is there, so it stays off.
+allowBuilds:
+  esbuild: false
+
+# A dependency isn't installable until it has been published for a day.
+minimumReleaseAge: 1440
