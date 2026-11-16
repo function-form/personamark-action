@@ -176,9 +176,16 @@ describe("run", () => {
 
 describe("parseFailOn and failures", () => {
   it("reads the rules and fails only on what they name", () => {
-    expect(parseFailOn("none")).toEqual({ newHigh: false, scoreDrop: null });
-    expect(parseFailOn(" New-High ,score-drop:3")).toEqual({ newHigh: true, scoreDrop: 3 });
+    expect(parseFailOn("none")).toEqual({ newHigh: false, scoreDrop: null, runFailed: false, runScoreDrop: null });
+    expect(parseFailOn(" New-High ,score-drop:3")).toMatchObject({ newHigh: true, scoreDrop: 3 });
+    expect(parseFailOn("run-failed, run-score-drop:10")).toEqual({
+      newHigh: false,
+      scoreDrop: null,
+      runFailed: true,
+      runScoreDrop: 10,
+    });
     expect(() => parseFailOn("score-drop:0")).toThrow();
+    expect(() => parseFailOn("run-score-drop")).toThrow();
     expect(failures(comparison(), parseFailOn("score-drop:7"))).toEqual([]);
     // A change that can't be compared never fails a drop rule.
     const rescored = comparison({ score: { now: 50, before: 90, change: null } });

@@ -23,6 +23,12 @@ inputs:
   pull-request:
     description: The pull request's number, to label a preview audit.
     default: ""
+  personas:
+    description: >-
+      With preview-url, persona and goal pairs to run on the preview and compare with their last
+      runs on production, as <persona-id>:<goal-id>, one a line (ids from GET /api/v1/personas). At
+      most 5; each run costs model calls.
+    default: ""
   wait:
     description: Wait for the audit to finish and report on it. With false, the step only starts it.
     default: "true"
@@ -39,8 +45,10 @@ inputs:
     default: ${{ github.token }}
   fail-on:
     description: >-
-      When to fail the step: `none`, `new-high` (an issue of high severity is new or back), or
-      `score-drop:<n>` (the score fell by n or more). Several, comma-separated.
+      When to fail the step: `none`, `new-high` (an issue of high severity is new or back),
+      `score-drop:<n>` (the score fell by n or more), `run-failed` (a persona didn't reach its goal on
+      the preview, though it does on production) or `run-score-drop:<n>` (a persona's score fell by n
+      or more against production's). Several, comma-separated.
     default: none
 
 outputs:
@@ -58,6 +66,10 @@ outputs:
     description: The change since the audit before, empty when the two can't be compared.
   new-high:
     description: How many issues of high severity are new or back.
+  runs:
+    description: >-
+      With personas, each run as JSON: personaId, goalId, previewRunId, status, outcome, score and
+      scoreChange.
 
 runs:
   using: node24

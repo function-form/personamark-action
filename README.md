@@ -95,12 +95,43 @@ The comment goes on the pull request the preview's commit belongs to, and a new 
 pull request updates it. Both scores leave out PageSpeed, which can't reach a protected preview, so
 the production score in the comment can differ from your latest audit's.
 
+### Before merging: run your personas on the preview
+
+A pull request can break a journey without adding a single SEO issue: the signup button moves, or
+the checkout form stops submitting. With `personas`, the action also sends each persona at its goal
+on the preview, and compares the run with that pair's last scored run on production. It's like an
+end-to-end test written as a goal instead of a script.
+
+Get the ids from `GET /api/v1/personas` (or `list_personas` over MCP), and give one
+`<persona-id>:<goal-id>` pair a line:
+
+```yaml
+      - uses: function-form/personamark-action@v1
+        with:
+          api-key: ${{ secrets.PERSONAMARK_API_KEY }}
+          preview-url: ${{ github.event.deployment_status.environment_url }}
+          personas: |
+            3f2b8c1e-7a4d-4e9b-8c21-5d6f7a8b9c0d:8b0f3c2e-4f0a-4f7e-9f61-0d1d3a8f5b21
+          fail-on: new-high, run-failed
+```
+
+The comment gets a table under the preview audit: each persona's outcome, score, change against
+production and how many problems it hit, with a link to the production run. It never quotes what
+the AI model wrote about the run, since a page can steer the model and anyone who can see the
+repository reads the comment.
+
+Each run is several model calls, so pick the few journeys you'd hate to break; the action takes at
+most 5 pairs, and the runs count towards the key's 24 a day. A run stays on the preview's host, and
+a goal that signs in with a test account needs an owner to allow logins on previews in
+**Settings** › **Crawling**. Scores are a model's judgement: a few points either way can be noise,
+so `run-failed` is the steadier rule.
+
 ## Inputs
 
 | Input             | Default                        | What it does                                                                                                                       |
 | ----------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `api-key`         | (required)                     | The site's API key, from a secret.                                                                                                 |
-| `fail-on`         | `none`                         | `new-high` fails when a high-severity issue is new or back; `score-drop:<n>` fails when the score fell by n or more. Comma-separate both. |
+| `fail-on`         | `none`                         | `new-high` fails when a high-severity issue is new or back; `score-drop:<n>` when the score fell by n or more; `run-failed` when a persona didn't reach its goal on the preview though it does on production (or has no run there); `run-score-drop:<n>` when a persona's score fell by n or more. Comma-separated. |
 | `wait`            | `true`                         | With `false`, the step only starts the audit.                                                                                      |
 | `timeout-minutes` | `30`                           | How long to wait for the audit. The audit carries on past it, and the step passes unless `fail-on` asks for something.             |
 | `comment`         | `true`                         | Post the summary as a comment too (see below). `false` keeps it to the job summary.                                                |
@@ -108,6 +139,7 @@ the production score in the comment can differ from your latest audit's.
 | `preview-url`     |                                | A preview deployment to audit and compare with production, instead of the site.                                                    |
 | `ref`             | the PR's head branch           | Labels a preview audit with its branch.                                                                                            |
 | `pull-request`    |                                | Labels a preview audit with its pull request's number.                                                                             |
+| `personas`        |                                | With `preview-url`, `<persona-id>:<goal-id>` pairs to run on the preview, one a line. At most 5.                                   |
 | `base-url`        | `https://work.personamark.app` | Where PersonaMark is.                                                                                                              |
 
 If an audit is already going when the step starts, it waits for that one instead of starting
@@ -116,7 +148,8 @@ another. A key can start 24 audits a day.
 ## Outputs
 
 `job-id` (or `preview-id`), `audit-id`, `audit-url`, `score`, `score-change` (empty when the two audits can't be
-compared, such as when the scoring rules changed), and `new-high`.
+compared, such as when the scoring rules changed), `new-high`, and with `personas`, `runs`: each run as JSON with its
+`previewRunId`, `status`, `outcome`, `score` and `scoreChange`.
 
 ## What it reports
 

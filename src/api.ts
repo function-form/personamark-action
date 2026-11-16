@@ -57,6 +57,41 @@ export interface PreviewRequest {
   pull_request?: number;
 }
 
+/** A run's figures: PersonaMark's labels and numbers, never the model's words. */
+export interface RunFigures {
+  outcome: string | null;
+  score: number | null;
+  steps: number;
+  areas: Record<string, { score: number; max: number }> | null;
+  friction: { total: number; blocking: number; moderate: number; minor: number; steps: number[] };
+}
+
+/** A persona's run at a goal on a preview, beside the pair's last scored run on production. */
+export interface PreviewRun {
+  id: string;
+  jobId: string;
+  status: Job["status"];
+  stage: string | null;
+  stalled: boolean;
+  error: string | null;
+  personaId: string | null;
+  goalId: string | null;
+  run: RunFigures | null;
+  production: (RunFigures & { url: string }) | null;
+  scoreChange: number | null;
+}
+
+export interface PreviewRunRequest extends PreviewRequest {
+  persona_id: string;
+  goal_id: string;
+}
+
+/** The site's personas and the goals that start on it, to name a run's pair. */
+export interface Pairs {
+  personas: { id: string; name: string }[];
+  goals: { id: string; sentence: string; signsIn: boolean }[];
+}
+
 export interface Job {
   id: string;
   status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
@@ -146,5 +181,26 @@ export class PersonaMark {
 
   comparePreview(previewId: string): Promise<PreviewComparison> {
     return this.#request("GET", `/previews/${encodeURIComponent(previewId)}/compare`);
+  }
+
+  /** Starts a persona's run on a preview, or joins the same pair's run on it already going. */
+  async startPreviewRun(request: PreviewRunRequest): Promise<{ previewRunId: string; joined: boolean }> {
+    try {
+      const { previewRunId } = await this.#request<{ previewRunId: string }>("POST", "/preview-runs", request);
+      return { previewRunId, joined: false };
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409 && typeof error.body.previewRunId === "string") {
+        return { previewRunId: error.body.previewRunId, joined: true };
+      }
+      throw error;
+    }
+  }
+
+  previewRun(previewRunId: string): Promise<PreviewRun> {
+    return this.#request("GET", `/preview-runs/${encodeURIComponent(previewRunId)}`);
+  }
+
+  pairs(): Promise<Pairs> {
+    return this.#request("GET", "/personas");
   }
 }
